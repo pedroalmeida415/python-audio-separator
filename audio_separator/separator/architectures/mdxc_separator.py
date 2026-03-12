@@ -1,16 +1,17 @@
 import os
 import sys
 
-import torch
 import numpy as np
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
+import torch
 from ml_collections import ConfigDict
 from scipy import signal
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from audio_separator.separator.common_separator import CommonSeparator
 from audio_separator.separator.uvr_lib_v5 import spec_utils
 from audio_separator.separator.uvr_lib_v5.tfc_tdf_v3 import TFC_TDF_net
+
 # Roformer direct constructors removed; loading handled via RoformerLoader in CommonSeparator.
 
 
@@ -101,6 +102,7 @@ class MDXCSeparator(CommonSeparator):
         self.overlap = arch_config.get("overlap", 8)
         self.batch_size = arch_config.get("batch_size", 1)
         self.num_workers = arch_config.get("num_workers", 0)
+        self.overlap_add_on_gpu = arch_config.get("overlap_add_on_gpu", False)
 
         # Amount of pitch shift to apply during processing (this does NOT affect the pitch of the output audio):
         # • Whole numbers indicate semitones.
@@ -111,7 +113,9 @@ class MDXCSeparator(CommonSeparator):
 
         self.process_all_stems = arch_config.get("process_all_stems", True)
 
-        self.logger.debug(f"MDXC arch params: batch_size={self.batch_size}, segment_size={self.segment_size}, overlap={self.overlap}, num_workers={self.num_workers}")
+        self.logger.debug(
+            f"MDXC arch params: batch_size={self.batch_size}, segment_size={self.segment_size}, overlap={self.overlap}, num_workers={self.num_workers}, overlap_add_on_gpu={self.overlap_add_on_gpu}"
+        )
         self.logger.debug(f"MDXC arch params: override_model_segment_size={self.override_model_segment_size}, pitch_shift={self.pitch_shift}")
         self.logger.debug(f"MDXC multi-stem params: process_all_stems={self.process_all_stems}")
 
@@ -366,30 +370,33 @@ class MDXCSeparator(CommonSeparator):
             step = chunk_size if desired_step <= 0 else min(desired_step, chunk_size)
             self.logger.debug(f"Step: {step} (desired={desired_step})")
 
-            # Create a weighting table and convert it to a PyTorch tensor
-            window = torch.tensor(signal.windows.hamming(chunk_size), dtype=torch.float32)
-
             device = next(self.model_run.parameters()).device
+            # Create a weighting table and convert it to a PyTorch tensor
+            use_gpu_overlap = self.overlap_add_on_gpu and device.type == "cuda"
+
+            window = torch.tensor(signal.windows.hamming(chunk_size), dtype=torch.float32, device=device if use_gpu_overlap else "cpu")
 
 
             with torch.no_grad():
                 req_shape = (len(self.model_data_cfgdict.training.instruments),) + tuple(mix.shape)
-                result = torch.zeros(req_shape, dtype=torch.float32)
-                counter = torch.zeros(req_shape, dtype=torch.float32)
+                result = torch.zeros(req_shape, dtype=torch.float32, device=device if use_gpu_overlap else "cpu")
+                counter = torch.zeros(req_shape, dtype=torch.float32, device=device if use_gpu_overlap else "cpu")
 
                 dataset = RoformerDataset(mix, chunk_size, step)
                 dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=(device.type == "cuda"))
 
                 for parts, start_idxs, lengths in tqdm(dataloader):
                     parts = parts.to(device)
-                    xs = self.model_run(parts).detach().cpu()
+                    xs = self.model_run(parts).detach()
+                    if not use_gpu_overlap:
+                        xs = xs.cpu()
 
                     for b in range(xs.shape[0]):
                         x = xs[b]
                         start_idx = start_idxs[b].item()
                         length = lengths[b].item()
 
-                        # Perform overlap_add on CPU
+                        # Perform overlap_add on the chosen device
                         result = self.overlap_add(result, x, window, start_idx, length)
                         safe_len = min(length, x.shape[-1], window.shape[0])
                         if safe_len > 0:
