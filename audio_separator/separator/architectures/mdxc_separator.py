@@ -103,6 +103,7 @@ class MDXCSeparator(CommonSeparator):
         self.batch_size = arch_config.get("batch_size", 1)
         self.num_workers = arch_config.get("num_workers", 0)
         self.overlap_add_on_gpu = arch_config.get("overlap_add_on_gpu", False)
+        self.overlap_add_vectorized = arch_config.get("overlap_add_vectorized", False)
 
         # Amount of pitch shift to apply during processing (this does NOT affect the pitch of the output audio):
         # • Whole numbers indicate semitones.
@@ -114,7 +115,7 @@ class MDXCSeparator(CommonSeparator):
         self.process_all_stems = arch_config.get("process_all_stems", True)
 
         self.logger.debug(
-            f"MDXC arch params: batch_size={self.batch_size}, segment_size={self.segment_size}, overlap={self.overlap}, num_workers={self.num_workers}, overlap_add_on_gpu={self.overlap_add_on_gpu}"
+            f"MDXC arch params: batch_size={self.batch_size}, segment_size={self.segment_size}, overlap={self.overlap}, num_workers={self.num_workers}, overlap_add_on_gpu={self.overlap_add_on_gpu}, overlap_add_vectorized={self.overlap_add_vectorized}"
         )
         self.logger.debug(f"MDXC arch params: override_model_segment_size={self.override_model_segment_size}, pitch_shift={self.pitch_shift}")
         self.logger.debug(f"MDXC multi-stem params: process_all_stems={self.process_all_stems}")
@@ -372,7 +373,8 @@ class MDXCSeparator(CommonSeparator):
 
             device = next(self.model_run.parameters()).device
             # Create a weighting table and convert it to a PyTorch tensor
-            use_gpu_overlap = self.overlap_add_on_gpu and device.type == "cuda"
+            use_vectorized_overlap = self.overlap_add_vectorized and device.type == "cuda"
+            use_gpu_overlap = (self.overlap_add_on_gpu or use_vectorized_overlap) and device.type == "cuda"
 
             window = torch.tensor(signal.windows.hamming(chunk_size), dtype=torch.float32, device=device if use_gpu_overlap else "cpu")
 
@@ -388,19 +390,52 @@ class MDXCSeparator(CommonSeparator):
                 for parts, start_idxs, lengths in tqdm(dataloader):
                     parts = parts.to(device)
                     xs = self.model_run(parts).detach()
-                    if not use_gpu_overlap:
-                        xs = xs.cpu()
 
-                    for b in range(xs.shape[0]):
-                        x = xs[b]
-                        start_idx = start_idxs[b].item()
-                        length = lengths[b].item()
+                    if use_vectorized_overlap:
+                        # Vectorized overlap-add using index_add on flattened channels
+                        start_idxs = start_idxs.to(device)
+                        lengths = lengths.to(device)
 
-                        # Perform overlap_add on the chosen device
-                        result = self.overlap_add(result, x, window, start_idx, length)
-                        safe_len = min(length, x.shape[-1], window.shape[0])
-                        if safe_len > 0:
-                            counter[..., start_idx : start_idx + safe_len] += window[:safe_len]
+                        batch_size, num_stems, num_channels, out_len = xs.shape
+                        time_offsets = torch.arange(out_len, device=device)
+                        time_idx = start_idxs[:, None] + time_offsets[None, :]
+
+                        # Mask to ignore padded tail when length < out_len
+                        valid_mask = time_offsets[None, :] < lengths[:, None]
+
+                        window_slice = window[:out_len]
+                        window_scaled = window_slice[None, None, None, :] * valid_mask[:, None, None, :]
+
+                        xs_scaled = xs * window_scaled
+
+                        xs_flat = xs_scaled.reshape(batch_size, num_stems * num_channels, out_len)
+                        counter_flat_src = window_scaled.expand(batch_size, num_stems, num_channels, out_len).reshape(
+                            batch_size, num_stems * num_channels, out_len
+                        )
+
+                        time_idx_flat = time_idx.reshape(-1)
+                        xs_flat_src = xs_flat.reshape(batch_size, num_stems * num_channels, out_len)
+
+                        result_flat = result.view(num_stems * num_channels, -1)
+                        counter_flat = counter.view(num_stems * num_channels, -1)
+
+                        for sc in range(num_stems * num_channels):
+                            result_flat[sc].index_add_(0, time_idx_flat, xs_flat_src[:, sc, :].reshape(-1))
+                            counter_flat[sc].index_add_(0, time_idx_flat, counter_flat_src[:, sc, :].reshape(-1))
+                    else:
+                        if not use_gpu_overlap:
+                            xs = xs.cpu()
+
+                        for b in range(xs.shape[0]):
+                            x = xs[b]
+                            start_idx = start_idxs[b].item()
+                            length = lengths[b].item()
+
+                            # Perform overlap_add on the chosen device
+                            result = self.overlap_add(result, x, window, start_idx, length)
+                            safe_len = min(length, x.shape[-1], window.shape[0])
+                            if safe_len > 0:
+                                counter[..., start_idx : start_idx + safe_len] += window[:safe_len]
 
             inferenced_outputs = result / counter.clamp(min=1e-10)
 

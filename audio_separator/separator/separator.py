@@ -100,7 +100,16 @@ class Separator:
         mdx_params={"hop_length": 1024, "segment_size": 256, "overlap": 0.25, "batch_size": 1, "enable_denoise": False},
         vr_params={"batch_size": 1, "window_size": 512, "aggression": 5, "enable_tta": False, "enable_post_process": False, "post_process_threshold": 0.2, "high_end_process": False},
         demucs_params={"segment_size": "Default", "shifts": 2, "overlap": 0.25, "segments_enabled": True},
-        mdxc_params={"segment_size": 256, "override_model_segment_size": False, "batch_size": 1, "overlap": 8, "pitch_shift": 0, "num_workers": 0, "overlap_add_on_gpu": False},
+        mdxc_params={
+            "segment_size": 256,
+            "override_model_segment_size": False,
+            "batch_size": 1,
+            "overlap": 8,
+            "pitch_shift": 0,
+            "num_workers": 0,
+            "overlap_add_on_gpu": False,
+            "overlap_add_vectorized": False,
+        },
         info_only=False,
     ):
         """Initialize the separator."""
