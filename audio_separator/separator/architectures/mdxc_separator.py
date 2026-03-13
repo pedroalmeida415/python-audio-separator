@@ -396,6 +396,11 @@ class MDXCSeparator(CommonSeparator):
                         start_idxs = start_idxs.to(device)
                         lengths = lengths.to(device)
 
+                        if xs.dim() == 3:
+                            xs = xs.unsqueeze(1)
+                        elif xs.dim() != 4:
+                            raise ValueError(f"Unexpected Roformer output shape: {tuple(xs.shape)}")
+
                         batch_size, num_stems, num_channels, out_len = xs.shape
                         time_offsets = torch.arange(out_len, device=device)
                         time_idx = start_idxs[:, None] + time_offsets[None, :]
